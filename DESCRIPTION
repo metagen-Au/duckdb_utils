@@ -1,4 +1,4 @@
-Package: duckdb_utils
+Package: rubberDucky
 Title: Utilities for Working with DuckDB and MotherDuck
 Version: 0.1.0
 Authors@R: 
