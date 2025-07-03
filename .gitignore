@@ -1,0 +1,30 @@
+# R specific files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+
+# Build artifacts
+*.o
+*.so
+*.dll
+*.Rproj
+
+# Documentation
+/doc/
+/Meta/
+man/*.Rd
+
+# Package build artifacts
+/duckdb_utils*.tar.gz
+/duckdb_utils*.tgz
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+.tern-port
+.envrc
+*_cache/

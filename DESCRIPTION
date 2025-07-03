@@ -1,0 +1,25 @@
+Package: duckdb_utils
+Title: Utilities for Working with DuckDB and MotherDuck
+Version: 0.1.0
+Authors@R: 
+    person("Chris", "Hames", email = "chris@metagen.com.au", role = c("aut", "cre"))
+Description: A collection of utility functions for working with DuckDB and 
+    MotherDuck databases. Provides simplified connection handling, connection 
+    pooling, and data upload functions with support for spatial data.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports:
+    DBI,
+    duckdb,
+    pool,
+    keyring,
+    tools
+Suggests:
+    sf,
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+Config/testthat/edition: 3
+VignetteBuilder: knitr

@@ -1,0 +1,188 @@
+---
+title: "Introduction to duckdb_utils"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to duckdb_utils}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, eval=FALSE}
+library(duckdb_utils)
+```
+
+## Overview
+
+`duckdb_utils` provides utilities for working with DuckDB and MotherDuck databases in R. This vignette will walk you through the basic functionality.
+
+## Connection Management
+
+### Creating a Connection
+
+Creating a connection to DuckDB is straightforward:
+
+```{r, eval=FALSE}
+# Connect to an in-memory database
+con <- create_duckdb_connection()
+
+# Connect to a local DuckDB file
+con <- create_duckdb_connection("my_database.duckdb")
+
+# Connect to MotherDuck
+con <- create_duckdb_connection("md:my_warehouse")
+```
+
+For MotherDuck connections, you'll need to provide a token, either by setting the `DUCKDB_MOTHERDUCK_TOKEN` environment variable or passing it directly:
+
+```{r, eval=FALSE}
+# Using environment variable (recommended)
+Sys.setenv(DUCKDB_MOTHERDUCK_TOKEN = "your_token")
+con <- create_duckdb_connection("md:my_warehouse")
+
+# Or passing directly
+con <- create_duckdb_connection("md:my_warehouse", token = "your_token")
+```
+
+### Working with Tables
+
+Check if a table exists:
+
+```{r, eval=FALSE}
+table_exists(con, "my_table")
+```
+
+Get the schema of a table:
+
+```{r, eval=FALSE}
+schema <- get_table_schema(con, "my_table")
+print(schema)
+```
+
+## Connection Pooling
+
+For applications that need to handle multiple database connections, `duckdb_utils` provides connection pooling:
+
+```{r, eval=FALSE}
+# Create a config.csv file with connection details:
+# dbpath
+# md:my_warehouse
+
+# Initialize the pool
+init_db_pool("path/to/config.csv", pool_size = 5)
+
+# Get a connection from the pool
+con <- get_pooled_connection()
+
+# Use the connection...
+# ...
+
+# Return the connection to the pool
+return_connection(con)
+
+# When done with the pool
+close_db_pool()
+```
+
+## Data Upload
+
+### Basic Upload
+
+Upload a data frame to DuckDB:
+
+```{r, eval=FALSE}
+data <- data.frame(
+  id = 1:5,
+  name = c("Alice", "Bob", "Charlie", "Dave", "Eve"),
+  score = c(85, 92, 78, 96, 88)
+)
+
+upload_data(
+  data = data,
+  table_name = "students",
+  con = con,
+  create_if_missing = TRUE
+)
+```
+
+### Upsert Operations
+
+Update existing records based on a key column:
+
+```{r, eval=FALSE}
+new_data <- data.frame(
+  id = c(1, 3, 6),
+  name = c("Alice Smith", "Charles", "Frank"),
+  score = c(90, 82, 91)
+)
+
+upload_data(
+  data = new_data,
+  table_name = "students",
+  con = con,
+  upsert_cols = "id"
+)
+```
+
+This will:
+- Update records for ids 1 and 3
+- Insert a new record for id 6
+
+### Spatial Data Upload
+
+If you have the `sf` package installed, you can upload spatial data:
+
+```{r, eval=FALSE}
+library(sf)
+
+# Create or load spatial data
+points <- st_as_sf(
+  data.frame(
+    id = 1:3,
+    x = c(-118.2, -122.4, -74.0),
+    y = c(34.0, 37.8, 40.7),
+    name = c("Los Angeles", "San Francisco", "New York")
+  ),
+  coords = c("x", "y"),
+  crs = 4326
+)
+
+# Upload to DuckDB
+upload_data(
+  data = points,
+  table_name = "cities",
+  con = con,
+  create_if_missing = TRUE
+)
+```
+
+### Large File Upload
+
+For large CSV or Parquet files, use the optimized `big_upload` function:
+
+```{r, eval=FALSE}
+# Upload a CSV file
+big_upload(
+  file_path = "large_data.csv",
+  table_name = "big_table",
+  con = con,
+  overwrite = TRUE
+)
+
+# Upload a Parquet file
+big_upload(
+  file_path = "large_data.parquet",
+  table_name = "parquet_table",
+  con = con
+)
+```
+
+## Conclusion
+
+`duckdb_utils` simplifies working with DuckDB and MotherDuck databases in R, providing convenient functions for connection management, pooling, and data upload. For more details, refer to the function documentation.
