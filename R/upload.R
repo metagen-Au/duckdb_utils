@@ -1,7 +1,8 @@
 #' @title DuckDB Upload Utilities with Validation, Transactions & Bulk Import
 #' @description
 #' Robust routines for uploading data frames, spatial tables, CSV/Parquet files,
-#' with schema inference, upserts, transaction safety, and optimized COPY for large imports.
+#' with schema inference, upserts, transaction safety, optimized COPY for large imports,
+#' proper identifier quoting, read-only enforcement, and cleanup.
 #' @import DBI
 #' @import duckdb
 #' @import dplyr
@@ -11,20 +12,30 @@
 #' @import sf
 NULL
 
-# Helper: check table existence on a pooled connection
-table_exists <- function(conn, table_name) {
-  DBI::dbExistsTable(conn, table_name)
+# Helper: safely quote an identifier
+db_ident <- function(con, x) {
+  DBI::dbQuoteIdentifier(con, x)
 }
 
-#' Upload data to DuckDB with type checking, upsert, spatial support, and transaction safety
+# Helper: safely quote a string literal
+db_str <- function(con, x) {
+  DBI::dbQuoteString(con, x)
+}
+
+# Check table existence
+table_exists <- function(con, table_name) {
+  DBI::dbExistsTable(con, table_name)
+}
+
+#' Upload data with transaction, validation, upsert, spatial support, and read-only enforcement
 #'
 #' @param data Data frame or sf object
-#' @param table_name Target table name
-#' @param conn Optional DBI connection or pool. If NULL, uses pooled connection from init_db_pool()
-#' @param create_if_missing Create table if it doesn't exist (default FALSE)
-#' @param schema Optional named list of DB types to override inference
-#' @param upsert_cols Optional character vector of key columns for upsert
-#' @param geom_col Optional geometry column name (WKT assumed)
+#' @param table_name Target table name (unquoted)
+#' @param conn Optional DBIConnection or DBIConnectionPool; if NULL, defaults to pooled connection
+#' @param create_if_missing Logical; create table if missing
+#' @param schema Named list of DB types to override inference
+#' @param upsert_cols Character vector of key columns for upsert
+#' @param geom_col Geometry column name for sf objects (WKT assumed)
 #' @export
 upload_data <- function(data,
                         table_name,
@@ -36,37 +47,50 @@ upload_data <- function(data,
   # Acquire connection
   if (is.null(conn)) {
     conn <- get_pooled_connection()
-    on.exit(return_connection(conn))
+    on.exit(return_connection(conn), add = TRUE)
+  }
+  # Enforce read-only flag
+  info <- DBI::dbGetInfo(conn)
+  if (!is.null(info$read_only) && info$read_only) {
+    stop("Cannot write to a read-only DuckDB connection/pool.")
   }
 
-  # Transaction wrapper
   DBI::dbWithTransaction(conn, {
-    # Prepare data
-    is_spatial <- inherits(data, "sf") || !is.null(geom_col)
-    if (is_spatial) {
-      if (!requireNamespace("sf", quietly = TRUE)) stop("sf required for spatial data")
-      if (is.null(geom_col)) geom_col <- attr(sf::st_geometry(data), "sf_column")
+    # Prepare spatial data
+    if (inherits(data, "sf") || (!is.null(geom_col) && geom_col %in% names(data))) {
+      if (!requireNamespace("sf", quietly = TRUE)) {
+        stop("Package 'sf' required for spatial uploads. Install with install.packages('sf').")
+      }
+      if (inherits(data, "sf")) {
+        geom_col <- attr(sf::st_geometry(data), "sf_column")
+      }
+      if (!geom_col %in% names(data)) {
+        stop(sprintf("Geometry column '%s' not found in data.", geom_col))
+      }
       data[[geom_col]] <- sf::st_as_text(sf::st_geometry(data))
       data <- sf::st_drop_geometry(data)
     }
 
     # Create table if needed
+    q_table <- db_ident(conn, table_name)
     if (!table_exists(conn, table_name)) {
-      if (!create_if_missing) stop(sprintf("Table '%s' not found. Set create_if_missing=TRUE.", table_name))
+      if (!create_if_missing) {
+        stop(sprintf("Table '%s' does not exist. Set create_if_missing=TRUE.", table_name))
+      }
       inferred <- infer_schema(data, geom_col)
-      final_schema <- if (is.null(schema)) inferred else modifyList(inferred, schema)
-      create_table(conn, table_name, final_schema)
+      types <- if (is.null(schema)) inferred else modifyList(inferred, schema)
+      create_table(conn, table_name, types)
     }
 
-    # Upsert or append
+    # Upsert vs append
     if (!is.null(upsert_cols)) {
       upsert_data(conn, data, table_name, upsert_cols)
     } else {
-      # Use copy_to for small-ish tables
+      # Small in-memory: use copy_to
       if (nrow(data) < 1e5) {
         dplyr::copy_to(conn, data, name = table_name, overwrite = FALSE, append = TRUE)
       } else {
-        DBI::dbWriteTable(conn, table_name, data, append = TRUE)
+        DBI::dbAppendTable(conn, table_name, data)
       }
     }
   })
@@ -75,10 +99,11 @@ upload_data <- function(data,
 #' Infer DuckDB schema from an R data.frame
 #'
 #' @param data Data frame
-#' @param geom_col Optional geometry column name
-#' @return Named list of column types
+#' @param geom_col Geometry column name
+#' @return Named list of DB types
 infer_schema <- function(data, geom_col = NULL) {
-  types <- vapply(data, function(x) {
+  types <- vapply(names(data), function(col_name) {
+    x <- data[[col_name]]
     if (is.factor(x)) {
       "VARCHAR"
     } else if (is.integer(x)) {
@@ -86,7 +111,6 @@ infer_schema <- function(data, geom_col = NULL) {
     } else if (is.numeric(x)) {
       if (all(x == floor(x), na.rm = TRUE)) "INTEGER" else "DOUBLE"
     } else if (is.character(x)) {
-      # assume reasonable length
       "VARCHAR"
     } else if (inherits(x, "Date")) {
       "DATE"
@@ -95,62 +119,70 @@ infer_schema <- function(data, geom_col = NULL) {
     } else if (is.logical(x)) {
       "BOOLEAN"
     } else {
-      stop(sprintf("Column '%s' has unsupported type %s", deparse(substitute(x)), class(x)[1]))
+      stop(sprintf("Unsupported column type '%s' for '%s'. Please coerce before upload.", class(x)[1], col_name))
     }
   }, character(1), USE.NAMES = TRUE)
 
   if (!is.null(geom_col) && geom_col %in% names(data)) {
-    types[geom_col] <- "VARCHAR"
+    types[[geom_col]] <- "VARCHAR"
   }
   types
 }
 
-#' Create a table in DuckDB
-#' @param con DBI connection
-#' @param table_name Table name
+#' Create a DuckDB table with quoted identifiers
+#' @param conn DBIConnection
+#' @param table_name Unquoted table name
 #' @param schema Named list of column types
-create_table <- function(con, table_name, schema) {
+create_table <- function(conn, table_name, schema) {
+  q_table <- db_ident(conn, table_name)
   fields <- paste(sprintf("%s %s", names(schema), schema), collapse = ", ")
-  sql <- sprintf("CREATE TABLE %s (%s)", table_name, fields)
-  DBI::dbExecute(con, sql)
+  sql <- sprintf("CREATE TABLE %s (%s)", q_table, fields)
+  message("Executing: ", sql)
+  DBI::dbExecute(conn, sql)
 }
 
-#' Upsert using DuckDB MERGE
-#' @param con DBI connection
+#' Upsert using DuckDB MERGE with cleanup and quoting
+#' @param conn DBIConnection
 #' @param data Data frame
-#' @param table_name Table name
-#' @param key_cols Vector of key columns
-upsert_data <- function(con, data, table_name, key_cols) {
+#' @param table_name Unquoted target table name
+#' @param key_cols Character vector of key columns
+#' @export
+upsert_data <- function(conn, data, table_name, key_cols) {
+  if (length(key_cols) < 1 || !all(key_cols %in% names(data))) {
+    stop("Provide at least one valid key column present in 'data'.")
+  }
   temp <- paste0("tmp_", table_name, "_", as.integer(Sys.time()))
-  DBI::dbWriteTable(con, temp, data, temporary = TRUE)
+  q_temp <- db_ident(conn, temp)
+  on.exit({ DBI::dbExecute(conn, sprintf("DROP TABLE IF EXISTS %s", q_temp)) }, add = TRUE)
 
-  keys <- paste(sprintf("target.%s = source.%s", key_cols, key_cols), collapse = " AND ")
+  message(sprintf("Writing to temp table %s...", temp))
+  DBI::dbWriteTable(conn, temp, data, temporary = TRUE, overwrite = TRUE)
+
+  # Build MERGE
+  q_table <- db_ident(conn, table_name)
+  condition <- paste(sprintf("target.%s = source.%s", key_cols, key_cols), collapse = " AND ")
   updates <- setdiff(names(data), key_cols)
-  upd_expr <- paste(sprintf("%s = source.%s", updates, updates), collapse = ", ")
+  upd_expr <- if (length(updates) == 0) "NOTHING" else paste(sprintf("%s = source.%s", updates, updates), collapse = ", ")
+  cols <- DBI::dbQuoteIdentifier(conn, names(data))
+  vals <- paste(sprintf("source.%s", names(data)), collapse = ", ")
 
   sql <- sprintf(
-    "MERGE %s AS target USING %s AS source ON %s
+    "MERGE INTO %s AS target USING %s AS source ON %s
      WHEN MATCHED THEN UPDATE SET %s
      WHEN NOT MATCHED THEN INSERT (%s) VALUES (%s)",
-    table_name, temp, keys,
-    upd_expr,
-    paste(names(data), collapse = ", "),
-    paste(sprintf("source.%s", names(data)), collapse = ", ")
+    q_table, q_temp, condition, upd_expr,
+    paste(cols, collapse = ", "), vals
   )
-  DBI::dbWithTransaction(con, {
-    DBI::dbExecute(con, sql)
-    DBI::dbExecute(con, sprintf("DROP TABLE %s", temp))
-  })
+  message("Executing MERGE...")
+  DBI::dbExecute(conn, sql)
 }
 
-#' Big Upload for DuckDB using optimized COPY for large files
-#'
+#' Bulk upload CSV/Parquet via COPY or SQL, with read-only enforcement, quoting, and transaction
 #' @param file_path Path to CSV or Parquet file
-#' @param table_name DuckDB table name
-#' @param conn Optional DBI connection
-#' @param overwrite Drop and recreate table if TRUE
-#' @param create Create table if missing
-#' @import DBI
+#' @param table_name Unquoted target table name
+#' @param conn DBIConnection or pool; if NULL uses pooled
+#' @param overwrite Logical; drop existing table if TRUE
+#' @param create Logical; create table if missing
 #' @export
 big_upload <- function(file_path,
                        table_name,
@@ -158,40 +190,43 @@ big_upload <- function(file_path,
                        overwrite = FALSE,
                        create = TRUE) {
   if (is.null(conn)) {
-    conn <- get_pooled_connection(); on.exit(return_connection(conn))
+    conn <- get_pooled_connection(); on.exit(return_connection(conn), add = TRUE)
   }
+  # enforce read-only
+  info <- DBI::dbGetInfo(conn)
+  if (!is.null(info$read_only) && info$read_only) stop("Cannot write via big_upload on a read-only connection.")
+  if (!file.exists(file_path)) stop(sprintf("File not found: %s", file_path))
   ext <- tolower(tools::file_ext(file_path))
-  DBI::dbWithTransaction(conn, {
-    if (overwrite) {
-      DBI::dbExecute(conn, sprintf("DROP TABLE IF EXISTS %s", table_name))
-    }
-    if (!overwrite && !table_exists(conn, table_name) && !create) {
-      stop("Table does not exist; set create=TRUE.")
-    }
-    # choose COPY for CSV, or Parquet SQL for parquet
-    if (ext %in% c("csv","txt")) {
-      # use parallel COPY
-      sql <- sprintf("COPY %s FROM '%s' (AUTO_DETECT TRUE)", table_name, file_path)
-    } else if (ext %in% c("parquet","pq")) {
-      sql <- sprintf(
-        if (overwrite || !table_exists(conn, table_name))
-          "CREATE TABLE %s AS SELECT * FROM read_parquet('%s')"
-        else
-          "INSERT INTO %s SELECT * FROM read_parquet('%s')",
-        table_name, file_path)
-    } else {
-      stop("Unsupported extension: ", ext)
-    }
+  q_table <- db_ident(conn, table_name)
+  q_path  <- db_str(conn, file_path)
 
-    if (ext %in% c("csv","txt")) {
-      if (overwrite || !table_exists(conn, table_name)) {
-        DBI::dbExecute(conn, sprintf("CREATE TABLE %s AS %s", table_name, sub("COPY", "SELECT * FROM read_csv_auto", sql)))
+  DBI::dbWithTransaction(conn, {
+    exists <- table_exists(conn, table_name)
+    if (overwrite && exists) {
+      message("Dropping existing table...")
+      DBI::dbExecute(conn, sprintf("DROP TABLE %s", q_table))
+      exists <- FALSE
+    }
+    if (!exists && !create) stop("Table missing and create=FALSE.")
+
+    if (ext %in% c("csv", "txt")) {
+      # Use COPY for CSV
+      sql <- sprintf("COPY %s FROM %s (AUTO_DETECT TRUE, HEADER TRUE)", q_table, q_path)
+      action <- if (!exists && create) "Creating and loading via COPY..." else "Appending via COPY..."
+      message(action)
+    } else if (ext %in% c("parquet", "pq")) {
+      if (!exists && create) {
+        sql <- sprintf("CREATE TABLE %s AS SELECT * FROM read_parquet(%s)", q_table, q_path)
+        message("Creating from Parquet...")
       } else {
-        DBI::dbExecute(conn, sub("COPY", "INSERT INTO", sql))
+        sql <- sprintf("INSERT INTO %s SELECT * FROM read_parquet(%s)", q_table, q_path)
+        message("Appending from Parquet...")
       }
     } else {
-      DBI::dbExecute(conn, sql)
+      stop("Unsupported file type: ", ext)
     }
+    message("Executing bulk upload SQL...")
+    DBI::dbExecute(conn, sql)
   })
-  message(sprintf("Upload complete: %s", table_name))
+  message(sprintf("Completed bulk upload to %s", table_name))
 }

@@ -1,64 +1,86 @@
-
-#' Create DuckDB / MotherDuck Connection
+#' Create a DuckDB or MotherDuck connection with memoization, token checking, and cleanup
 #'
-#' @param dbdir Path to local DuckDB file, or a MotherDuck warehouse name (e.g. "md:my_warehouse")
-#' @param read_only Logical, open DB read-only?
-#' @param token Optional token for MotherDuck (defaults to `Sys.getenv("DUCKDB_MOTHERDUCK_TOKEN")`)
-#' @return DBI connection object
-#' @import duckdb
+#' @param dbdir Path to DuckDB file or MotherDuck URI (e.g. "md:my_warehouse")
+#' @param read_only Logical; if TRUE, the connection is opened read-only
+#' @param token MotherDuck token (defaults to Sys.getenv("DUCKDB_MOTHERDUCK_TOKEN")); NULL to skip
+#' @return A memoized DBIConnection
 #' @import DBI
+#' @import duckdb
 #' @export
-create_duckdb_connection <- function(dbdir = ":memory:", read_only = FALSE, token = Sys.getenv("DUCKDB_MOTHERDUCK_TOKEN")) {
-  if (grepl("^md:", dbdir)) {
-    # Connect to MotherDuck using token
-    if (nzchar(token)) {
-      duckdb::duckdb_register_token(token)
-    } else {
-      warning("No MotherDuck token found in DUCKDB_MOTHERDUCK_TOKEN. Connection may fail.")
+create_duckdb_connection <- local({
+  cache <- new.env(parent = emptyenv())
+  function(dbdir     = ":memory:",
+           read_only = FALSE,
+           token     = Sys.getenv("DUCKDB_MOTHERDUCK_TOKEN")) {
+
+    key <- paste(dbdir, read_only, token, sep = "|")
+    if (exists(key, envir = cache)) {
+      con <- cache[[key]]
+      if (DBI::dbIsValid(con)) return(con)
     }
+
+    # MotherDuck URIs require a non‐empty token
+    if (grepl("^md:", dbdir)) {
+      if (!nzchar(token)) {
+        stop("A valid MotherDuck token is required when dbdir starts with 'md:'.")
+      }
+      tryCatch(
+        duckdb::duckdb_register_token(token),
+        error = function(e) stop("Invalid MotherDuck token: ", e$message)
+      )
+    }
+
+    # Attempt to connect, with clear failure message
+    con <- tryCatch(
+      DBI::dbConnect(duckdb::duckdb(), dbdir = dbdir, read_only = read_only),
+      error = function(e) stop("Failed to connect to DuckDB at '", dbdir, "': ", e$message)
+    )
+
+    # Ensure we clean up the connection at session end or GC
+    reg.finalizer(con, function(ptr) {
+      if (DBI::dbIsValid(ptr)) {
+        DBI::dbDisconnect(ptr)
+      }
+    }, onexit = TRUE)
+
+    cache[[key]] <- con
+    con
   }
+})
 
-  con <- DBI::dbConnect(
-    duckdb::duckdb(),
-    dbdir = dbdir,
-    read_only = read_only
-  )
-
-  return(con)
-}
-
-#' Check if Table Exists
+#' Check if a table exists
 #'
-#' @param con Database connection
-#' @param table_name Table to check
-#' @return TRUE if table exists, else FALSE
+#' @param con A DBIConnection
+#' @param table_name Unquoted table name
+#' @return Logical; TRUE if the table exists
 #' @import DBI
 #' @export
 table_exists <- function(con, table_name) {
   DBI::dbExistsTable(con, table_name)
 }
 
-#' Get Table Schema
+#' Get detailed schema for a DuckDB table
 #'
-#' @param con Database connection
-#' @param table_name Table name
-#' @return Data frame of column names and types
+#' @param con A DBIConnection
+#' @param table_name Unquoted table name
+#' @return A tibble with columns: column, type, not_null, default, is_pk
 #' @import DBI
+#' @import tibble
 #' @export
 get_table_schema <- function(con, table_name) {
-  if (!table_exists(con, table_name)) {
-    stop(sprintf("Table '%s' does not exist", table_name))
+  qname <- DBI::dbQuoteIdentifier(con, table_name)
+  info  <- DBI::dbGetQuery(con,
+            sprintf("PRAGMA table_info(%s)", qname)
+         )
+  if (nrow(info) == 0) {
+    stop("Table '", table_name, "' does not exist or has no columns")
   }
 
-  query <- sprintf("PRAGMA table_info(%s)", table_name)
-  result <- DBI::dbGetQuery(con, query)
-
-  # Normalize output to match expectation
-  schema <- data.frame(
-    column_name = result$name,
-    data_type = result$type,
-    stringsAsFactors = FALSE
+  tibble::tibble(
+    column    = info$name,
+    type      = info$type,
+    not_null  = as.logical(info$notnull),
+    default   = info$dflt_value,
+    is_pk     = info$pk == 1
   )
-
-  return(schema)
 }
